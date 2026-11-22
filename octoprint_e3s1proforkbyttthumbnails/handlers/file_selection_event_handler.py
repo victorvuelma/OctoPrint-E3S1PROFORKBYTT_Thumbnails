@@ -1,6 +1,8 @@
 # coding=utf-8
 """File selection and transfer lifecycle event handler."""
 
+import posixpath
+
 from ..events.types import Event, EventType
 from .base import EventHandler
 
@@ -17,11 +19,26 @@ class FileSelectionEventHandler(EventHandler):
         self._plugin = plugin
         super().__init__()
 
+    def _is_helper_transfer(self, payload):
+        """Return whether a TransferDone payload belongs to the helper file.
+
+        OctoPrint 1.x reports the name passed to ``add_sd_file`` as ``local``.
+        OctoPrint 2.x reports the remote path (which may carry a leading
+        ``/`` and be lower case) as both ``local`` and ``remote``, and plans to
+        drop ``local`` in 3.0.0. Compare base names so all of these match.
+        """
+        helper = self._plugin._helper_basename.upper()
+        for key in ("local", "remote"):
+            name = payload.get(key) or ""
+            if posixpath.basename(name).upper() == helper:
+                return True
+        return False
+
     def handle(self, event: Event):
         payload = event.payload
 
         if event.type == EventType.TRANSFER_DONE:
-            if payload.get("local", "").upper() == self._plugin._helper_basename:
+            if self._is_helper_transfer(payload):
                 self._plugin._logger.debug(
                     f"Dispatching TransferDone for helper local={payload.get('local')}"
                 )

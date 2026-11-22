@@ -42,9 +42,9 @@ class PrinterSyncService:
 
         try:
             self.delete_existing_sd_helper(helper_basename)
-            remote_name = self._printer.add_sd_file(
-                helper_basename,
+            remote_name = self._start_helper_transfer(
                 helper_path,
+                helper_basename,
                 tags={
                     "source:plugin",
                     "plugin:e3s1proforkbyttthumbnails",
@@ -58,6 +58,27 @@ class PrinterSyncService:
                 f"Failed to upload helper to printer SD: {exc}", exc_info=True
             )
             return False
+
+    def _start_helper_transfer(self, helper_path, helper_basename, tags):
+        """Stream ``helper_path`` (on disk) to the printer as ``helper_basename``.
+
+        ``Printer.add_sd_file(filename, path)`` changed meaning in OctoPrint 2.0:
+
+        * OctoPrint 1.x streams the file on disk at ``path`` and uses
+          ``filename`` as the remote name.
+        * OctoPrint 2.x streams the file found in *local storage* at
+          ``filename`` and uses ``path`` as the remote name.
+
+        The core always passes the same file in both arguments, so it is not
+        affected, but this plugin sends a sidecar under a fixed remote name.
+        OctoPrint 2.x is detected by ``is_storage_mounted``, which was added
+        to the printer API in 2.0.0.
+        """
+        if hasattr(self._printer, "is_storage_mounted"):
+            local_path = self._file_manager.path_in_storage("local", helper_path)
+            return self._printer.add_sd_file(local_path, helper_basename, tags=tags)
+
+        return self._printer.add_sd_file(helper_basename, helper_path, tags=tags)
 
     def purge_uploads_helper(self, helper_basename, hint_rel_path=None):
         """Remove helper copies that may have appeared in local uploads."""
