@@ -9,6 +9,8 @@ import re
 import octoprint.util
 from PIL import Image
 
+from .gcode_utils import is_extrusion_move
+
 
 class ThumbnailService:
     """Extracts embedded thumbnails from supported G-code files."""
@@ -76,11 +78,7 @@ class ThumbnailService:
         collected = ""
         with open(gcode_filename, "r", encoding="utf8", errors="ignore") as gcode_file:
             for line_num, line in enumerate(gcode_file, start=1):
-                gcode = octoprint.util.comm.gcode_command_for_cmd(line)
-                extrusion_match = octoprint.util.comm.regexes_parameters[
-                    "floatE"
-                ].search(line)
-                if gcode == "G1" and extrusion_match:
+                if is_extrusion_move(line):
                     self._logger.debug(
                         f"Line {line_num}: detected first extrusion, stopping header scan."
                     )

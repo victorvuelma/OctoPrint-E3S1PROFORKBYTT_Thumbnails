@@ -6,6 +6,8 @@ import re
 
 import octoprint.util
 
+from .gcode_utils import is_extrusion_move
+
 
 class HelperFileService:
     """Builds and filters the helper G-code file sent to printer SD."""
@@ -53,17 +55,14 @@ class HelperFileService:
                 gcode_filename, "r", encoding="utf8", errors="ignore"
             ) as gcode_file:
                 for line_num, line in enumerate(gcode_file, start=1):
-                    gcode = octoprint.util.comm.gcode_command_for_cmd(line)
-                    extrusion_match = octoprint.util.comm.regexes_parameters[
-                        "floatE"
-                    ].search(line)
+                    extrusion = is_extrusion_move(line)
                     if line.startswith(";"):
                         replace_next_line = True
                     if replace_next_line:
                         line = "M4010" + line[1:]
                         replace_next_line = False
                     collected += line
-                    if gcode == "G1" and extrusion_match:
+                    if extrusion:
                         self._logger.debug(
                             f"Line {line_num}: detected first extrusion, stopping helper scan."
                         )
