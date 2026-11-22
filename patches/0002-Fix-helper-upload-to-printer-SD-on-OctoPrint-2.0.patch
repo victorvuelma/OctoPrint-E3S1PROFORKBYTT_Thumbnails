@@ -1,0 +1,262 @@
+From a4f26b2d6e027abe2db8d7d0df22659dd56f23e1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 22 Nov 2026 17:56:14 -0300
+Subject: [PATCH 2/2] Fix helper upload to printer SD on OctoPrint 2.0
+
+Printer.add_sd_file(filename, path) changed meaning in OctoPrint 2.0.0:
+
+* 1.x streams the file on disk at `path` and uses `filename` as the
+  remote name.
+* 2.x streams the file at `filename` in *local storage* and uses `path`
+  as the remote target.
+
+OctoPrint's core always passes the same file in both arguments, so it
+is unaffected. This plugin sends the `.thumb` sidecar under the fixed
+remote name OCTODGUS.GCO, so on 2.x it tried to stream
+`uploads/OCTODGUS.GCO` (which the plugin purges just before) and to name
+the remote file after the sidecar's absolute path. The firmware never
+got its helper.
+
+Pick the argument order by feature detection (`is_storage_mounted` was
+added to the printer API in 2.0.0).
+
+TransferDone also changed: 2.x reports the remote path (possibly with a
+leading "/" and lower case) as both `local` and `remote`, and `local` is
+slated for removal in 3.0.0. Match the helper by base name of either
+field.
+
+Add tests for both argument orders, a test that runs OctoPrint 2.x's own
+Printer.add_sd_file and checks what it streams, and tests for the
+TransferDone payload shapes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T9yYaTfwp21kvTkb3Tj7fp
+---
+ .../handlers/file_selection_event_handler.py  |  19 ++-
+ .../services/printer_sync_service.py          |  25 +++-
+ tests/test_octoprint2_helper_transfer.py      | 128 ++++++++++++++++++
+ 3 files changed, 169 insertions(+), 3 deletions(-)
+ create mode 100644 tests/test_octoprint2_helper_transfer.py
+
+diff --git a/octoprint_e3s1proforkbyttthumbnails/handlers/file_selection_event_handler.py b/octoprint_e3s1proforkbyttthumbnails/handlers/file_selection_event_handler.py
+index c63d4ee..e4ac585 100644
+--- a/octoprint_e3s1proforkbyttthumbnails/handlers/file_selection_event_handler.py
++++ b/octoprint_e3s1proforkbyttthumbnails/handlers/file_selection_event_handler.py
+@@ -1,6 +1,8 @@
+ # coding=utf-8
+ """File selection and transfer lifecycle event handler."""
+ 
++import posixpath
++
+ from ..events.types import Event, EventType
+ from .base import EventHandler
+ 
+@@ -17,11 +19,26 @@ class FileSelectionEventHandler(EventHandler):
+         self._plugin = plugin
+         super().__init__()
+ 
++    def _is_helper_transfer(self, payload):
++        """Return whether a TransferDone payload belongs to the helper file.
++
++        OctoPrint 1.x reports the name passed to ``add_sd_file`` as ``local``.
++        OctoPrint 2.x reports the remote path (which may carry a leading
++        ``/`` and be lower case) as both ``local`` and ``remote``, and plans to
++        drop ``local`` in 3.0.0. Compare base names so all of these match.
++        """
++        helper = self._plugin._helper_basename.upper()
++        for key in ("local", "remote"):
++            name = payload.get(key) or ""
++            if posixpath.basename(name).upper() == helper:
++                return True
++        return False
++
+     def handle(self, event: Event):
+         payload = event.payload
+ 
+         if event.type == EventType.TRANSFER_DONE:
+-            if payload.get("local", "").upper() == self._plugin._helper_basename:
++            if self._is_helper_transfer(payload):
+                 self._plugin._logger.debug(
+                     f"Dispatching TransferDone for helper local={payload.get('local')}"
+                 )
+diff --git a/octoprint_e3s1proforkbyttthumbnails/services/printer_sync_service.py b/octoprint_e3s1proforkbyttthumbnails/services/printer_sync_service.py
+index fd6a66b..44316b8 100644
+--- a/octoprint_e3s1proforkbyttthumbnails/services/printer_sync_service.py
++++ b/octoprint_e3s1proforkbyttthumbnails/services/printer_sync_service.py
+@@ -42,9 +42,9 @@ class PrinterSyncService:
+ 
+         try:
+             self.delete_existing_sd_helper(helper_basename)
+-            remote_name = self._printer.add_sd_file(
+-                helper_basename,
++            remote_name = self._start_helper_transfer(
+                 helper_path,
++                helper_basename,
+                 tags={
+                     "source:plugin",
+                     "plugin:e3s1proforkbyttthumbnails",
+@@ -59,6 +59,27 @@ class PrinterSyncService:
+             )
+             return False
+ 
++    def _start_helper_transfer(self, helper_path, helper_basename, tags):
++        """Stream ``helper_path`` (on disk) to the printer as ``helper_basename``.
++
++        ``Printer.add_sd_file(filename, path)`` changed meaning in OctoPrint 2.0:
++
++        * OctoPrint 1.x streams the file on disk at ``path`` and uses
++          ``filename`` as the remote name.
++        * OctoPrint 2.x streams the file found in *local storage* at
++          ``filename`` and uses ``path`` as the remote name.
++
++        The core always passes the same file in both arguments, so it is not
++        affected, but this plugin sends a sidecar under a fixed remote name.
++        OctoPrint 2.x is detected by ``is_storage_mounted``, which was added
++        to the printer API in 2.0.0.
++        """
++        if hasattr(self._printer, "is_storage_mounted"):
++            local_path = self._file_manager.path_in_storage("local", helper_path)
++            return self._printer.add_sd_file(local_path, helper_basename, tags=tags)
++
++        return self._printer.add_sd_file(helper_basename, helper_path, tags=tags)
++
+     def purge_uploads_helper(self, helper_basename, hint_rel_path=None):
+         """Remove helper copies that may have appeared in local uploads."""
+         self._logger.debug(
+diff --git a/tests/test_octoprint2_helper_transfer.py b/tests/test_octoprint2_helper_transfer.py
+new file mode 100644
+index 0000000..ca8f103
+--- /dev/null
++++ b/tests/test_octoprint2_helper_transfer.py
+@@ -0,0 +1,128 @@
++import os
++import tempfile
++import unittest
++import warnings
++from types import SimpleNamespace
++from unittest.mock import MagicMock, Mock
++
++try:
++    from octoprint_e3s1proforkbyttthumbnails.events.types import Event, EventType
++    from octoprint_e3s1proforkbyttthumbnails.handlers.file_selection_event_handler import (
++        FileSelectionEventHandler,
++    )
++    from octoprint_e3s1proforkbyttthumbnails.services.printer_sync_service import (
++        PrinterSyncService,
++    )
++
++    IMPORT_ERROR = None
++except Exception as exc:  # pragma: no cover - environment dependent
++    IMPORT_ERROR = exc
++
++HELPER = "OCTODGUS.GCO"
++TAGS = {"source:plugin"}
++
++
++class _FileManager:
++    """Minimal stand-in that maps between disk paths and local storage paths."""
++
++    def __init__(self, basefolder):
++        self.basefolder = basefolder
++
++    def path_in_storage(self, location, path):
++        assert location == "local"
++        return os.path.relpath(path, self.basefolder).replace(os.sep, "/")
++
++    def path_on_disk(self, location, path):
++        assert location == "local"
++        return os.path.join(self.basefolder, *path.split("/"))
++
++
++@unittest.skipIf(IMPORT_ERROR is not None, f"plugin import failed: {IMPORT_ERROR}")
++class StartHelperTransferTests(unittest.TestCase):
++    def setUp(self):
++        self.basefolder = tempfile.mkdtemp()
++        self.sidecar = os.path.join(self.basefolder, "sub", "benchy.gcode.thumb")
++        self.file_manager = _FileManager(self.basefolder)
++
++    def test_octoprint_1_argument_order(self):
++        printer = Mock(spec=["add_sd_file"])  # no is_storage_mounted -> 1.x
++        service = PrinterSyncService(Mock(), printer, self.file_manager)
++
++        service._start_helper_transfer(self.sidecar, HELPER, TAGS)
++
++        printer.add_sd_file.assert_called_once_with(HELPER, self.sidecar, tags=TAGS)
++
++    def test_octoprint_2_argument_order(self):
++        printer = Mock(spec=["add_sd_file", "is_storage_mounted"])
++        service = PrinterSyncService(Mock(), printer, self.file_manager)
++
++        service._start_helper_transfer(self.sidecar, HELPER, TAGS)
++
++        printer.add_sd_file.assert_called_once_with(
++            "sub/benchy.gcode.thumb", HELPER, tags=TAGS
++        )
++
++    def test_octoprint_2_real_add_sd_file_streams_sidecar_as_helper(self):
++        """Run OctoPrint 2.x's own Printer.add_sd_file and check what it streams."""
++        try:
++            with warnings.catch_warnings():
++                warnings.simplefilter("ignore", DeprecationWarning)
++                import octoprint.filemanager  # noqa: F401  (avoids a circular import)
++                from octoprint.printer.standard import Printer
++        except Exception:
++            self.skipTest("OctoPrint is not installed")
++        if not hasattr(Printer, "is_storage_mounted"):
++            self.skipTest("installed OctoPrint is older than 2.0")
++
++        printer = MagicMock()
++        printer.is_storage_mounted.return_value = True
++        printer._connection.is_ready.return_value = True
++        printer._connection.current_storage_capabilities.write_file = True
++        printer.sd_card_upload_hooks = {}
++        printer._file_manager = self.file_manager
++        printer.add_sd_file = lambda *args, **kwargs: Printer.add_sd_file(
++            printer, *args, **kwargs
++        )
++
++        service = PrinterSyncService(Mock(), printer, self.file_manager)
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore", DeprecationWarning)
++            service._start_helper_transfer(self.sidecar, HELPER, TAGS)
++
++        source, target = printer._connection.upload_printer_file.call_args.args
++        self.assertEqual(source, self.sidecar)
++        self.assertEqual(target, HELPER)
++
++
++@unittest.skipIf(IMPORT_ERROR is not None, f"plugin import failed: {IMPORT_ERROR}")
++class HelperTransferDoneDetectionTests(unittest.TestCase):
++    def _handler(self):
++        plugin = SimpleNamespace(
++            _helper_basename=HELPER, _logger=Mock(), _workflow=Mock()
++        )
++        return FileSelectionEventHandler(plugin), plugin
++
++    def _dispatch(self, payload):
++        handler, plugin = self._handler()
++        handler.handle(Event(EventType.TRANSFER_DONE, payload))
++        return plugin._workflow.handle_helper_transfer_done.called
++
++    def test_octoprint_1_payload(self):
++        self.assertTrue(self._dispatch({"local": HELPER, "remote": "/octodgus.gco"}))
++
++    def test_octoprint_2_payload(self):
++        self.assertTrue(
++            self._dispatch({"local": "/octodgus.gco", "remote": "/octodgus.gco"})
++        )
++
++    def test_payload_without_local(self):
++        self.assertTrue(self._dispatch({"remote": "OCTODGUS.GCO"}))
++
++    def test_other_file_is_ignored(self):
++        self.assertFalse(
++            self._dispatch({"local": "benchy.gco", "remote": "/benchy.gco"})
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+

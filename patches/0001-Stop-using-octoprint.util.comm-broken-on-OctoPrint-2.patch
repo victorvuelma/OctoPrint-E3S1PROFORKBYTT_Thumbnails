@@ -1,0 +1,217 @@
+From 21e759b6ae9620da80d84e351a9a5e31cdf99eaf Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 22 Nov 2026 17:55:19 -0300
+Subject: [PATCH 1/2] Stop using octoprint.util.comm (broken on OctoPrint 2.0)
+
+OctoPrint 2.0.0 moved the comm layer into the bundled serial_connector
+plugin. octoprint.util.comm is now only a deprecated re-export shim that
+the core no longer imports, so `octoprint.util.comm.gcode_command_for_cmd`
+fails with:
+
+    AttributeError: module 'octoprint.util' has no attribute 'comm'
+
+ThumbnailService and HelperFileService only used it to find the first
+extrusion move. Replace that with a local `is_extrusion_move()` helper
+with the same semantics, so the plugin no longer depends on OctoPrint
+internals for it.
+
+Add tests that pin the expected behaviour and, when OctoPrint is
+installed, compare it against OctoPrint's original implementation.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01T9yYaTfwp21kvTkb3Tj7fp
+---
+ .../services/gcode_utils.py                   | 31 +++++++
+ .../services/helper_file_service.py           |  9 +--
+ .../services/thumbnail_service.py             |  8 +-
+ tests/test_gcode_utils.py                     | 81 +++++++++++++++++++
+ 4 files changed, 119 insertions(+), 10 deletions(-)
+ create mode 100644 octoprint_e3s1proforkbyttthumbnails/services/gcode_utils.py
+ create mode 100644 tests/test_gcode_utils.py
+
+diff --git a/octoprint_e3s1proforkbyttthumbnails/services/gcode_utils.py b/octoprint_e3s1proforkbyttthumbnails/services/gcode_utils.py
+new file mode 100644
+index 0000000..7619ed7
+--- /dev/null
++++ b/octoprint_e3s1proforkbyttthumbnails/services/gcode_utils.py
+@@ -0,0 +1,31 @@
++# coding=utf-8
++"""Small G-code helpers that do not depend on OctoPrint internals.
++
++OctoPrint 2.0.0 moved the old comm layer (``octoprint.util.comm``) into the
++bundled ``serial_connector`` plugin. ``octoprint.util.comm`` only survives as a
++deprecated re-export shim that the core no longer imports, so accessing it as
++``octoprint.util.comm`` after ``import octoprint.util`` raises
++``AttributeError``. The plugin only needed it to find the first extrusion move,
++so that logic lives here instead.
++"""
++
++import re
++
++# Equivalent to ``octoprint...serial_comm.gcode_command_for_cmd(line) == "G1"``:
++# matches "G1" and "G1.<subcode>", but not "G10", "G11" or "G01". Like
++# OctoPrint, this is case sensitive.
++_G1_COMMAND_REGEX = re.compile(r"^\s*G1(?!\d)")
++
++# Same pattern as OctoPrint's ``regexes_parameters["floatE"]``. Like the
++# original check, it is applied to the whole line, comments included.
++_FLOAT_E_REGEX = re.compile(r"(^|[^A-Za-z])[Ee](?P<value>[-+]?[0-9]*\.?[0-9]+)")
++
++
++def is_extrusion_move(line):
++    """Return whether ``line`` is a ``G1`` command carrying an ``E`` parameter.
++
++    This mirrors the check the plugin used to do with
++    ``octoprint.util.comm`` and is used to stop scanning a G-code header at
++    the first extrusion.
++    """
++    return bool(_G1_COMMAND_REGEX.search(line) and _FLOAT_E_REGEX.search(line))
+diff --git a/octoprint_e3s1proforkbyttthumbnails/services/helper_file_service.py b/octoprint_e3s1proforkbyttthumbnails/services/helper_file_service.py
+index 7c4995e..93e9704 100644
+--- a/octoprint_e3s1proforkbyttthumbnails/services/helper_file_service.py
++++ b/octoprint_e3s1proforkbyttthumbnails/services/helper_file_service.py
+@@ -6,6 +6,8 @@ import re
+ 
+ import octoprint.util
+ 
++from .gcode_utils import is_extrusion_move
++
+ 
+ class HelperFileService:
+     """Builds and filters the helper G-code file sent to printer SD."""
+@@ -53,17 +55,14 @@ class HelperFileService:
+                 gcode_filename, "r", encoding="utf8", errors="ignore"
+             ) as gcode_file:
+                 for line_num, line in enumerate(gcode_file, start=1):
+-                    gcode = octoprint.util.comm.gcode_command_for_cmd(line)
+-                    extrusion_match = octoprint.util.comm.regexes_parameters[
+-                        "floatE"
+-                    ].search(line)
++                    extrusion = is_extrusion_move(line)
+                     if line.startswith(";"):
+                         replace_next_line = True
+                     if replace_next_line:
+                         line = "M4010" + line[1:]
+                         replace_next_line = False
+                     collected += line
+-                    if gcode == "G1" and extrusion_match:
++                    if extrusion:
+                         self._logger.debug(
+                             f"Line {line_num}: detected first extrusion, stopping helper scan."
+                         )
+diff --git a/octoprint_e3s1proforkbyttthumbnails/services/thumbnail_service.py b/octoprint_e3s1proforkbyttthumbnails/services/thumbnail_service.py
+index 041961e..dd2fb82 100644
+--- a/octoprint_e3s1proforkbyttthumbnails/services/thumbnail_service.py
++++ b/octoprint_e3s1proforkbyttthumbnails/services/thumbnail_service.py
+@@ -9,6 +9,8 @@ import re
+ import octoprint.util
+ from PIL import Image
+ 
++from .gcode_utils import is_extrusion_move
++
+ 
+ class ThumbnailService:
+     """Extracts embedded thumbnails from supported G-code files."""
+@@ -76,11 +78,7 @@ class ThumbnailService:
+         collected = ""
+         with open(gcode_filename, "r", encoding="utf8", errors="ignore") as gcode_file:
+             for line_num, line in enumerate(gcode_file, start=1):
+-                gcode = octoprint.util.comm.gcode_command_for_cmd(line)
+-                extrusion_match = octoprint.util.comm.regexes_parameters[
+-                    "floatE"
+-                ].search(line)
+-                if gcode == "G1" and extrusion_match:
++                if is_extrusion_move(line):
+                     self._logger.debug(
+                         f"Line {line_num}: detected first extrusion, stopping header scan."
+                     )
+diff --git a/tests/test_gcode_utils.py b/tests/test_gcode_utils.py
+new file mode 100644
+index 0000000..8187e3e
+--- /dev/null
++++ b/tests/test_gcode_utils.py
+@@ -0,0 +1,81 @@
++import importlib.util
++import os
++import unittest
++import warnings
++
++# Load the module straight from its file so this test does not need OctoPrint
++# (the package's __init__ imports the plugin, which imports OctoPrint).
++_MODULE_PATH = os.path.join(
++    os.path.dirname(__file__),
++    os.pardir,
++    "octoprint_e3s1proforkbyttthumbnails",
++    "services",
++    "gcode_utils.py",
++)
++_spec = importlib.util.spec_from_file_location("gcode_utils", _MODULE_PATH)
++gcode_utils = importlib.util.module_from_spec(_spec)
++_spec.loader.exec_module(gcode_utils)
++
++is_extrusion_move = gcode_utils.is_extrusion_move
++
++EXPECTED = {
++    "G1 X10 E1.5": True,
++    "G1 F1800 E-2": True,
++    "  G1 X1 E.5": True,
++    "G1 X5 Y5 E0.4 F1200": True,
++    "G1X10E1": True,
++    "G1.1 X1 E2": True,
++    "G1 X1 e2": True,
++    "G1 X1 ; E3": True,  # inherited quirk: E inside a comment also counts
++    "G1 X1 Y2": False,
++    "G1 Z0.2 F600": False,
++    "G1 X1 E": False,
++    "G1 X1 NE1": False,
++    "g1 X1 E1": False,
++    "G0 E5": False,
++    "G10 E1": False,
++    "G11 E1": False,
++    "G01 X1 E1": False,
++    "G28": False,
++    "G92 E0": False,
++    "M104 S200": False,
++    "; G1 E5": False,
++    "T0": False,
++    "": False,
++}
++
++
++def _octoprint_reference():
++    """Return OctoPrint's original check, or None if it is not available."""
++    try:
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore", DeprecationWarning)
++            from octoprint.util.comm import gcode_command_for_cmd, regexes_parameters
++    except Exception:
++        return None
++
++    def reference(line):
++        return gcode_command_for_cmd(line) == "G1" and bool(
++            regexes_parameters["floatE"].search(line)
++        )
++
++    return reference
++
++
++class IsExtrusionMoveTests(unittest.TestCase):
++    def test_expected_values(self):
++        for line, expected in EXPECTED.items():
++            with self.subTest(line=line):
++                self.assertIs(is_extrusion_move(line), expected)
++
++    def test_matches_octoprint_reference_implementation(self):
++        reference = _octoprint_reference()
++        if reference is None:
++            self.skipTest("OctoPrint is not installed")
++        for line in EXPECTED:
++            with self.subTest(line=line):
++                self.assertEqual(is_extrusion_move(line), reference(line))
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+
